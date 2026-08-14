@@ -34,6 +34,7 @@ from vllm.v1.spec_decode.utils import (
     PADDING_SLOT_ID,
     eagle_prepare_inputs_padded_kernel,
     eagle_prepare_next_token_padded_kernel,
+    ensure_gather_draft_hidden_states_extension,
     gather_draft_hidden_states,
 )
 from vllm.v1.utils import CpuGpuBuffer
@@ -154,11 +155,21 @@ class SparseAttnProposer:
             with_numpy=True,
         )
 
+        # Rejected/short draft batches need the CUDA gather helper. Loading it
+        # lazily from get_draft_probs makes the first generate() call appear
+        # stuck while nvcc runs in the engine process.
+        logger.info(
+            "Loading sparse-attention CUDA extensions. The first run can "
+            "take several minutes while nvcc compiles them."
+        )
+        ensure_gather_draft_hidden_states_extension()
+
         # Initialize attention overrider.
         self.attn_overrider = build_attention_overrider(
             vllm_config=self.vllm_config,
             device=self.device,
         )
+        logger.info("Sparse-attention CUDA extensions are ready.")
 
     @property
     def sampled_token_ids(self) -> torch.Tensor:
@@ -313,8 +324,8 @@ class SparseAttnProposer:
         block_ids = common_attn_metadata.block_table_tensor.gather(
             dim=1, index=block_numbers.view(-1, 1))
         block_ids = block_ids.view(-1)
-        common_attn_metadata.slot_mapping[:num_tokens].copy_((
-            block_ids * self.block_size + clamped_positions % self.block_size))
+        common_attn_metadata.slot_mapping[:num_tokens].copy_(
+            block_ids * self.block_size + clamped_positions % self.block_size)
         # Mask out the slot mappings that exceed the max model length.
         # Otherwise, the KV cache will be updated with the padding tokens.
         common_attn_metadata.slot_mapping[:num_tokens].masked_fill_(

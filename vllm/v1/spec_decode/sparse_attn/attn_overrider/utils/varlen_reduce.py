@@ -26,7 +26,6 @@ Output (bf16): output (batch, max_seqlen)
 Accumulation in fp32.
 """
 
-import os
 import torch
 from torch.utils.cpp_extension import load_inline
 
@@ -383,11 +382,6 @@ def _get_module():
     if _module is not None:
         return _module
 
-    os.environ.setdefault(
-        "TORCH_CUDA_ARCH_LIST",
-        "8.0;8.9;9.0",
-    )
-
     _module = load_inline(
         name="varlen_reduce_jit",
         cpp_sources=_CPP_SRC,
@@ -402,6 +396,11 @@ def _get_module():
         verbose=False,
     )
     return _module
+
+
+def ensure_varlen_reduce_extension() -> None:
+    """Build/load the CUDA extension before request processing starts."""
+    _get_module()
 
 
 # ----------------------------------------------------------------

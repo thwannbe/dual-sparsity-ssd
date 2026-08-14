@@ -1,0 +1,412 @@
+diff --git a/csrc/flash_attn/flash_api.cpp b/csrc/flash_attn/flash_api.cpp
+index aa66087..21cbc39 100644
+--- a/csrc/flash_attn/flash_api.cpp
++++ b/csrc/flash_attn/flash_api.cpp
+@@ -534,7 +534,8 @@ mha_varlen_fwd(at::Tensor &q,  // total_q x num_heads x head_size, total_q := \s
+                const float softcap,
+                const bool return_softmax,
+                int num_splits,
+-               std::optional<at::Generator> gen_) {
++               std::optional<at::Generator> gen_,
++               std::optional<at::Tensor> &scores_) {
+ 
+     // Otherwise the kernel will be launched from cuda:0 device
+     at::cuda::CUDAGuard device_guard{q.device()};
+@@ -591,7 +592,10 @@ mha_varlen_fwd(at::Tensor &q,  // total_q x num_heads x head_size, total_q := \s
+ 
+     // Faster to transpose q from (b, 1, (nheads_kv ngroups), d) to (b, ngroups, nheads_kv, d) in this case
+     // H/t Daniel Haziza
+-    const int seqlenq_ngroups_swapped = max_seqlen_q == 1 && num_heads > num_heads_k && window_size_left < 0 && window_size_right < 0 && p_dropout == 0.f && head_size % 8 == 0 && !alibi_slopes_.has_value();
++    // The packed-GQA decode optimization changes the logical query/head
++    // coordinates. Keep the ordinary layout while collecting scores so that
++    // (batch, query_head, first_or_last, key) remains unambiguous.
++    const int seqlenq_ngroups_swapped = max_seqlen_q == 1 && num_heads > num_heads_k && window_size_left < 0 && window_size_right < 0 && p_dropout == 0.f && head_size % 8 == 0 && !alibi_slopes_.has_value() && !scores_.has_value();
+     const int ngroups = num_heads / num_heads_k;
+     if (seqlenq_ngroups_swapped) {
+         q = q.reshape({batch_size, num_heads_k, ngroups, head_size}).transpose(1, 2).reshape({batch_size * ngroups, num_heads_k, head_size});
+@@ -700,6 +704,24 @@ mha_varlen_fwd(at::Tensor &q,  // total_q x num_heads x head_size, total_q := \s
+         params.v_batch_stride = v.stride(0);
+     }
+     params.page_block_size = page_block_size;
++
++    if (scores_.has_value()) {
++        auto scores = scores_.value();
++        TORCH_CHECK(window_size_left < 0,
++                    "attention scores collection is not supported with local / sliding-window attention");
++        TORCH_CHECK(scores.scalar_type() == at::ScalarType::BFloat16,
++                    "scores must have dtype bfloat16");
++        CHECK_DEVICE(scores);
++        TORCH_CHECK(scores.stride(-1) == 1,
++                    "scores tensor must have contiguous last dimension");
++        TORCH_CHECK(scores.size(0) == batch_size && scores.size(1) == sizes[1]
++                    && scores.size(2) == 2 && scores.size(3) >= max_seqlen_k,
++                    "scores must have shape (batch_size, num_heads, 2, >= max_seqlen_k)");
++        params.scores_ptr = scores.data_ptr();
++        params.scores_batch_stride = scores.stride(0);
++        params.scores_head_stride = scores.stride(1);
++        params.scores_row_stride = scores.stride(2);
++    }
+     // Keep references to these tensors to extend their lifetime
+     at::Tensor softmax_lse_accum, out_accum;
+     if (seqlenq_ngroups_swapped) {
+diff --git a/csrc/flash_attn/flash_api_torch_lib.cpp b/csrc/flash_attn/flash_api_torch_lib.cpp
+index be2d23c..bd185a0 100644
+--- a/csrc/flash_attn/flash_api_torch_lib.cpp
++++ b/csrc/flash_attn/flash_api_torch_lib.cpp
+@@ -36,7 +36,8 @@ mha_varlen_fwd(at::Tensor &q,  // total_q x num_heads x head_size, total_q := \s
+                const float softcap,
+                const bool return_softmax,
+                int num_splits,
+-               std::optional<at::Generator> gen_);
++               std::optional<at::Generator> gen_,
++               std::optional<at::Tensor> &scores_);
+ 
+ std::vector<at::Tensor>
+ mha_fwd_kvcache(at::Tensor &q,                 // batch_size x seqlen_q x num_heads x head_size
+@@ -110,7 +111,7 @@ TORCH_LIBRARY_EXPAND(TORCH_EXTENSION_NAME, ops) {
+             "Tensor cu_seqlens_k, Tensor? seqused_k, Tensor? leftpad_k, Tensor? block_table, Tensor? alibi_slopes, "
+             "int max_seqlen_q, int max_seqlen_k, float p_dropout, float softmax_scale, bool zero_tensors, "
+             "bool is_causal, int window_size_left, int window_size_right, float softcap, bool return_softmax, "
+-            "int num_splits, Generator? gen) -> Tensor[]");
++            "int num_splits, Generator? gen, Tensor!? scores=None) -> Tensor[]");
+     ops.impl("varlen_fwd", torch::kCUDA, make_pytorch_shim(&mha_varlen_fwd));
+ 
+     ops.def("fwd_kvcache(Tensor! q, Tensor kcache, Tensor vcache, Tensor? k, Tensor? v, Tensor? seqlens_k, "
+@@ -139,4 +140,4 @@ TORCH_LIBRARY_EXPAND(TORCH_EXTENSION_NAME, ops) {
+ 
+ REGISTER_EXTENSION(TORCH_EXTENSION_NAME);
+ 
+-} // namespace FLASH_NAMESPACE
+\ No newline at end of file
++} // namespace FLASH_NAMESPACE
+diff --git a/csrc/flash_attn/src/flash.h b/csrc/flash_attn/src/flash.h
+index 8ffbb62..8056607 100644
+--- a/csrc/flash_attn/src/flash.h
++++ b/csrc/flash_attn/src/flash.h
+@@ -63,6 +63,13 @@ struct Flash_fwd_params : public Qkv_params {
+     void * __restrict__ softmax_lse_ptr;
+     void * __restrict__ softmax_lseaccum_ptr;
+ 
++    // Optional raw attention scores for the first and last query of each
++    // variable-length request. Shape: (batch, heads, 2, max_seqlen_k).
++    void * __restrict__ scores_ptr;
++    index_t scores_batch_stride;
++    index_t scores_head_stride;
++    index_t scores_row_stride;
++
+     // The dimensions.
+     int b, seqlen_q, seqlen_k, seqlen_knew, d, seqlen_q_rounded, seqlen_k_rounded, d_rounded, rotary_dim, total_q;
+ 
+diff --git a/csrc/flash_attn/src/flash_fwd_kernel.h b/csrc/flash_attn/src/flash_fwd_kernel.h
+index 7512828..4aff091 100644
+--- a/csrc/flash_attn/src/flash_fwd_kernel.h
++++ b/csrc/flash_attn/src/flash_fwd_kernel.h
+@@ -47,6 +47,60 @@ __forceinline__ __device__ auto get_lse_tile(const Params &params, const int bid
+         return local_tile(mLSE_slice, Shape<Int<kBlockM>>{}, make_coord(m_block));
+ }
+ 
++// Store the pre-softmax QK scores for the first and last query rows.  The
++// accumulator is still in the MMA-owned register layout here, so partition an
++// identity tensor in exactly the same way to recover each register's logical
++// (query, key) coordinate. This keeps score collection fused with FA2 instead
++// of launching a second QK kernel and rereading the paged KV cache.
++template<typename Kernel_traits, typename Params, typename AccTensor>
++__forceinline__ __device__ void write_first_last_scores(
++        const Params &params, AccTensor &acc_s, const int bidb,
++        const int bidh, const int m_block, const int n_block,
++        const int actual_seqlen_q, const int actual_seqlen_k,
++        const int tidx) {
++    if (params.scores_ptr == nullptr || actual_seqlen_q <= 0) { return; }
++
++    constexpr int kBlockM = Kernel_traits::kBlockM;
++    constexpr int kBlockN = Kernel_traits::kBlockN;
++    const int last_q = actual_seqlen_q - 1;
++    const int first_m_block = 0;
++    const int last_m_block = last_q / kBlockM;
++    if (m_block != first_m_block && m_block != last_m_block) { return; }
++
++    typename Kernel_traits::TiledMma tiled_mma;
++    auto thr_mma = tiled_mma.get_thread_slice(tidx);
++    Tensor cS = make_identity_tensor(Shape<Int<kBlockM>, Int<kBlockN>>{});
++    Tensor tScS = thr_mma.partition_C(cS);
++    Tensor scores = make_tensor(
++        acc_s.data(), FLASH_NAMESPACE::convert_layout_acc_rowcol(acc_s.layout()));
++    Tensor coords = make_tensor(
++        tScS.data(), FLASH_NAMESPACE::convert_layout_acc_rowcol(tScS.layout()));
++
++    auto *scores_ptr = reinterpret_cast<cutlass::bfloat16_t *>(params.scores_ptr);
++    #pragma unroll
++    for (int m = 0; m < size<0>(scores); ++m) {
++        const int query = m_block * kBlockM + get<0>(coords(m, _0{}));
++        if (query != 0 && query != last_q) { continue; }
++        if (query >= actual_seqlen_q) { continue; }
++        const int output_row = query == 0 ? 0 : 1;
++        const int64_t base = bidb * params.scores_batch_stride
++            + bidh * params.scores_head_stride
++            + output_row * params.scores_row_stride;
++        #pragma unroll
++        for (int n = 0; n < size<1>(scores); ++n) {
++            const int key = n_block * kBlockN + get<1>(coords(_0{}, n));
++            if (key < actual_seqlen_k) {
++                scores_ptr[base + key] = cutlass::bfloat16_t(scores(m, n));
++                // For a one-token query the first and last rows are identical.
++                if (last_q == 0) {
++                    scores_ptr[base + params.scores_row_stride + key] =
++                        cutlass::bfloat16_t(scores(m, n));
++                }
++            }
++        }
++    }
++}
++
+ 
+ template<typename Kernel_traits, bool Is_dropout, bool Is_causal, bool Is_local, bool Has_alibi, bool Is_even_MN, bool Is_even_K, bool Is_softcap, bool Return_softmax, typename Params>
+ inline __device__ void compute_attn_1rowblock(const Params &params, const int bidb, const int bidh, const int m_block) {
+@@ -329,6 +383,10 @@ inline __device__ void compute_attn_1rowblock(const Params &params, const int bi
+             acc_s, n_block * kBlockN, m_block * kBlockM + (tidx / 32) * 16 + (tidx % 32) / 4, kNWarps * 16
+         );
+ 
++        write_first_last_scores<Kernel_traits>(
++            params, acc_s, bidb, bidh, m_block, n_block,
++            binfo.actual_seqlen_q, binfo.actual_seqlen_k, tidx);
++
+         FLASH_NAMESPACE::cp_async_wait<0>();
+         __syncthreads();
+         if (n_block > n_block_min) {
+@@ -404,6 +462,10 @@ inline __device__ void compute_attn_1rowblock(const Params &params, const int bi
+             acc_s, n_block * kBlockN, m_block * kBlockM + (tidx / 32) * 16 + (tidx % 32) / 4, kNWarps * 16
+         );
+ 
++        write_first_last_scores<Kernel_traits>(
++            params, acc_s, bidb, bidh, m_block, n_block,
++            binfo.actual_seqlen_q, binfo.actual_seqlen_k, tidx);
++
+         softmax.template softmax_rescale_o</*Is_first=*/false, /*Check_inf=*/Is_local>(acc_s, acc_o, params.scale_softmax_log2);
+ 
+         Tensor rP = FLASH_NAMESPACE::convert_type<Element>(acc_s);
+@@ -913,6 +975,10 @@ inline __device__ void compute_attn_1rowblock_splitkv(const Params &params, cons
+             acc_s, n_block * kBlockN, m_block * kBlockM + (tidx / 32) * 16 + (tidx % 32) / 4, kNWarps * 16
+         );
+ 
++        write_first_last_scores<Kernel_traits>(
++            params, acc_s, bidb, bidh, m_block, n_block,
++            binfo.actual_seqlen_q, binfo.actual_seqlen_k, tidx);
++
+         FLASH_NAMESPACE::cp_async_wait<0>();
+         __syncthreads();
+         // if (tidx == 0 && blockIdx.y == 0 && blockIdx.z == 0) { print(tVsV); }
+@@ -997,6 +1063,9 @@ inline __device__ void compute_attn_1rowblock_splitkv(const Params &params, cons
+         mask.template apply_mask</*Causal_mask=*/false>(
+             acc_s, n_block * kBlockN, m_block * kBlockM + (tidx / 32) * 16 + (tidx % 32) / 4, kNWarps * 16
+         );
++        write_first_last_scores<Kernel_traits>(
++            params, acc_s, bidb, bidh, m_block, n_block,
++            binfo.actual_seqlen_q, binfo.actual_seqlen_k, tidx);
+         softmax.template softmax_rescale_o</*Is_first=*/false, /*Check_inf=*/Is_local>(acc_s, acc_o, params.scale_softmax_log2);
+ 
+         Tensor rP = FLASH_NAMESPACE::convert_type<Element>(acc_s);
+diff --git a/vllm_flash_attn/flash_attn_interface.py b/vllm_flash_attn/flash_attn_interface.py
+index eb20632..e7d386c 100644
+--- a/vllm_flash_attn/flash_attn_interface.py
++++ b/vllm_flash_attn/flash_attn_interface.py
+@@ -54,6 +54,17 @@ def _is_fa3_supported(device = None) -> Tuple[bool, Optional[str]]:
+             "FA3 is only supported on devices with compute capability 9.0"
+     return True, None
+ 
++def is_fa3_sm8x_paged_kv_available(device = None) -> bool:
++    """Whether the optional FA3-style SM8x paged-KV kernels are usable.
++
++    This does not make FA3 the default Ampere backend.  It only exposes the
++    native paged-KV mainloop to callers that explicitly opt into it.
++    """
++    if not FA3_AVAILABLE:
++        return False
++    major = torch.cuda.get_device_capability(device)[0]
++    return major == 8
++
+ def _is_fa4_supported(device = None) -> Tuple[bool, Optional[str]]:
+     if not FA4_AVAILABLE:
+         return False, f"FA4 is unavaible due to: {FA4_UNAVAILABLE_REASON}"
+@@ -274,6 +274,7 @@ def flash_attn_varlen_func(
+             return_softmax_lse and dropout_p > 0,
+             num_splits,
+             None,
++            scores,
+         )
+     elif fa_version == 3:
+         assert alibi_slopes is None, "Alibi is not supported in FA3"
+diff --git a/CMakeLists.txt b/CMakeLists.txt
+index 643d7d1..71a2d9e 100644
+--- a/CMakeLists.txt
++++ b/CMakeLists.txt
+@@ -178,6 +178,33 @@ endif ()
+ 
+ # FA3 requires CUDA 12.0 or later
+ if (FA3_ENABLED AND ${CMAKE_CUDA_COMPILER_VERSION} GREATER_EQUAL 12.0)
++    # The FA3 codebase also contains its original SM80/SM86 mainloop.  vLLM
++    # normally omits it because FA2 is the default backend on Ampere.  Build
++    # these existing kernels when an SM8x target is requested so sparse draft
++    # attention can use native one-token pages without changing the default
++    # attention backend.
++    if (VLLM_GPU_LANG STREQUAL "CUDA")
++        cuda_archs_loose_intersection(FA3_SM8X_ARCHS
++            "8.0;8.6;8.9" "${CUDA_ARCHS}")
++        message(STATUS "FA3_SM8X_ARCHS: ${FA3_SM8X_ARCHS}")
++        cuda_archs_loose_intersection(FA3_ARCHS
++            "9.0a;" "${CUDA_ARCHS}")
++        message(STATUS "FA3_ARCHS: ${FA3_ARCHS}")
++    endif()
++
++    set(FA3_SM8X_GEN_SRCS)
++    if (FA3_SM8X_ARCHS)
++        foreach(FA3_SM8X_HEAD_DIM 64 96 128 192 256)
++            foreach(FA3_SM8X_DTYPE bf16 fp16)
++                list(APPEND FA3_SM8X_GEN_SRCS
++                    "hopper/instantiations/flash_fwd_hdim${FA3_SM8X_HEAD_DIM}_${FA3_SM8X_DTYPE}_sm80.cu"
++                    "hopper/instantiations/flash_fwd_hdim${FA3_SM8X_HEAD_DIM}_${FA3_SM8X_DTYPE}_paged_sm80.cu"
++                    "hopper/instantiations/flash_fwd_hdim${FA3_SM8X_HEAD_DIM}_${FA3_SM8X_DTYPE}_split_sm80.cu"
++                    "hopper/instantiations/flash_fwd_hdim${FA3_SM8X_HEAD_DIM}_${FA3_SM8X_DTYPE}_paged_split_sm80.cu")
++            endforeach()
++        endforeach()
++    endif()
++
+     # BF16 source files
+     file(GLOB FA3_BF16_GEN_SRCS
+         "hopper/instantiations/flash_fwd_hdim64_bf16*_sm90.cu"
+@@ -218,22 +245,38 @@ if (FA3_ENABLED AND ${CMAKE_CUDA_COMPILER_VERSION} GREATER_EQUAL 12.0)
+         "hopper/instantiations/flash_fwd_hdim192_128_e4m3*_sm90.cu")
+     list(APPEND FA3_FP8_GEN_SRCS ${FA3_FP8_GEN_SRCS_})
+ 
+-    set(FA3_GEN_SRCS ${FA3_BF16_GEN_SRCS} ${FA3_FP16_GEN_SRCS} ${FA3_FP8_GEN_SRCS})
++    set(FA3_SM90_GEN_SRCS
++        ${FA3_BF16_GEN_SRCS}
++        ${FA3_FP16_GEN_SRCS}
++        ${FA3_FP8_GEN_SRCS})
++    if (FA3_SM8X_ARCHS AND NOT FA3_ARCHS)
++        set(FA3_SM90_GEN_SRCS)
++    endif()
++    set(FA3_GEN_SRCS ${FA3_SM90_GEN_SRCS} ${FA3_SM8X_GEN_SRCS})
+ 
+     # For CUDA we set the architectures on a per file basis
+     # FaV3 is not yet supported in Blackwell
+     if (VLLM_GPU_LANG STREQUAL "CUDA")
+-        cuda_archs_loose_intersection(FA3_ARCHS "9.0a;" "${CUDA_ARCHS}")
+-        message(STATUS "FA3_ARCHS: ${FA3_ARCHS}")
+-
+         set_gencode_flags_for_srcs(
+-            SRCS "${FA3_GEN_SRCS}"
++            SRCS "${FA3_SM90_GEN_SRCS}"
+             CUDA_ARCHS "${FA3_ARCHS}")
++        if (FA3_SM8X_ARCHS)
++            set_gencode_flags_for_srcs(
++                SRCS "${FA3_SM8X_GEN_SRCS}"
++                CUDA_ARCHS "${FA3_SM8X_ARCHS}")
++        endif()
+         set_gencode_flags_for_srcs(
+             SRCS 
+                 hopper/flash_fwd_combine.cu
+                 hopper/flash_prepare_scheduler.cu
+             CUDA_ARCHS "${FA3_ARCHS}")
++        if (FA3_SM8X_ARCHS)
++            set_gencode_flags_for_srcs(
++                SRCS
++                    hopper/flash_fwd_combine.cu
++                    hopper/flash_prepare_scheduler.cu
++                CUDA_ARCHS "${FA3_SM8X_ARCHS}")
++        endif()
+     endif()
+ 
+     define_gpu_extension_target(
+@@ -267,13 +310,23 @@ if (FA3_ENABLED AND ${CMAKE_CUDA_COMPILER_VERSION} GREATER_EQUAL 12.0)
+         FLASHATTENTION_DISABLE_PYBIND
+         FLASHATTENTION_VARLEN_ONLY # Custom flag to save on binary size
+         FLASHATTENTION_DISABLE_CLUSTER # disabled for varlen in any case
+-        FLASHATTENTION_DISABLE_SM8x
+         # FLASHATTENTION_DISABLE_HDIMDIFF64
+         # FLASHATTENTION_DISABLE_HDIMDIFF192
+         FLASHATTENTION_DISABLE_APPENDKV
+         CUTE_SM90_EXTENDED_MMA_SHAPES_ENABLED
+         CUTLASS_ENABLE_GDC_FOR_SM90
+     )
++    # Keep Hopper-only builds identical to upstream.  Removing this definition
++    # without also compiling the SM8x instantiations would leave unresolved
++    # dispatch targets in flash_api.cpp.
++    if (NOT FA3_SM8X_ARCHS)
++        target_compile_definitions(_vllm_fa3_C PRIVATE
++            FLASHATTENTION_DISABLE_SM8x)
++    endif()
++    if (FA3_SM8X_ARCHS AND NOT FA3_ARCHS)
++        target_compile_definitions(_vllm_fa3_C PRIVATE
++            FLASHATTENTION_DISABLE_SM90)
++    endif()
+ elseif(${CMAKE_CUDA_COMPILER_VERSION} VERSION_LESS 12.0)
+     message(STATUS "FA3 is disabled because CUDA version is not 12.0 or later.")
+ endif ()
+diff --git a/hopper/mainloop_fwd_sm80.hpp b/hopper/mainloop_fwd_sm80.hpp
+index a7c42fe..ce60990 100644
+--- a/hopper/mainloop_fwd_sm80.hpp
++++ b/hopper/mainloop_fwd_sm80.hpp
+@@ -146,6 +146,10 @@ struct CollectiveMainloopFwdSm80 {
+     using ShapeQKV = cute::Shape<int32_t, int32_t, int32_t, int32_t>;  // (seqlen, d, head, batch)
+     using StrideQK = cute::Stride<int64_t, _1, int64_t, int64_t>;
+     using StrideV = StrideQK;
++    // Keep the host-side argument ABI aligned with the SM90 mainloop. SM8x
++    // does not collect verification scores, but the shared launcher supplies
++    // these fields before the context-parallel arguments.
++    using StrideLogits = cute::Stride<int64_t, int64_t, int64_t, _1>;
+     // ((qhead_per_khead, seqlen_q), d, nheads_kv, batch, num_splits)
+     using ShapeQPacked = std::conditional_t<!PackGQA, ShapeQKV, cute::Shape<cute::Shape<int32_t, int32_t>, int32_t, int32_t, int32_t>>;
+     using StrideQPacked = std::conditional_t<!PackGQA, StrideQK, cute::Stride<cute::Stride<int64_t, int64_t>, _1, int64_t, int64_t>>;
+@@ -215,6 +219,9 @@ struct CollectiveMainloopFwdSm80 {
+         int const* const leftpad_k = nullptr;
+         int const* const seqlens_rotary = nullptr;
+         ElementSAux const* const ptr_S_aux = nullptr;
++        cutlass::bfloat16_t* const ptr_logits = nullptr;
++        StrideLogits const stride_logits = {};
++        int32_t const max_seqlen_k = 0;
+         int cp_world_size;
+         int cp_rank;
+         int const* const cp_tot_seqused_k = nullptr;
+diff --git a/hopper/static_switch.h b/hopper/static_switch.h
+index 45bf0cf..356cc27 100644
+--- a/hopper/static_switch.h
++++ b/hopper/static_switch.h
+@@ -155,6 +155,18 @@
+     constexpr static int ARCH_NAME = 90;                                                         \
+     return __VA_ARGS__();                                                                        \
+   }()
++#elif defined(FLASHATTENTION_DISABLE_SM90)
++  #define ARCH_SWITCH(ARCH, ARCH_NAME, ...)                                                      \
++  [&] {                                                                                          \
++    TORCH_CHECK(ARCH < 90, "This flash attention build only supports SM8x GPUs.");              \
++    if (ARCH == 86 || ARCH == 89) {                                                              \
++      constexpr static int ARCH_NAME = 86;                                                       \
++      return __VA_ARGS__();                                                                      \
++    } else {                                                                                     \
++      constexpr static int ARCH_NAME = 80;                                                       \
++      return __VA_ARGS__();                                                                      \
++    }                                                                                            \
++  }()
+ #else
+   #define ARCH_SWITCH(ARCH, ARCH_NAME, ...)                                                      \
+   [&] {                                                                                          \
+@@ -218,4 +230,4 @@
+       return __VA_ARGS__();                                                                      \
+     }                                                                                            \
+   }()
+-#endif
+\ No newline at end of file
++#endif
+diff --git a/hopper/flash_api.cpp b/hopper/flash_api.cpp
+index 0d22605..bdc2761 100644
+--- a/hopper/flash_api.cpp
++++ b/hopper/flash_api.cpp
+@@ -357,7 +357,7 @@ void run_mha_fwd(Flash_fwd_params &params, cudaStream_t stream) {
+                             }
+                         } else {
+-                            #ifndef FLASHATTENTION_DISABLE_FP8
++                            #if !defined(FLASHATTENTION_DISABLE_FP8) && !defined(FLASHATTENTION_DISABLE_SM90)
+                             #ifndef FLASHATTENTION_DISABLE_HDIM64
+                             if (params.d <= 64) { return run_mha_fwd_<90, cutlass::float_e4m3_t, 64, 64, Split, PagedKVNonTMA, Has_softcap, PackGQA>(params, stream); }
+                             #endif
+                             #ifndef FLASHATTENTION_DISABLE_HDIM96

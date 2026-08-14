@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 import functools
+
 import torch
 from torch.utils.cpp_extension import load_inline
 
@@ -467,6 +468,11 @@ def _get_gather_cuda_module():
         verbose=False,
         extra_cuda_cflags=["-O3", "--use_fast_math"],
     )
+
+
+def ensure_gather_draft_hidden_states_extension() -> None:
+    """Build/load the gather extension before request processing starts."""
+    _get_gather_cuda_module()
 
 
 def gather_draft_hidden_states(

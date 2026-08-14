@@ -10,9 +10,7 @@ Input:  metric (batch_size, max_len) — float16/bfloat16/float32
 Output: out_idxs (batch_size, max_k) — int32, filled in-place
 """
 
-import os
 import torch
-from typing import Optional
 from torch.utils.cpp_extension import load_inline
 
 # ----------------------------------------------------------------
@@ -641,11 +639,6 @@ def _get_module():
     if _module is not None:
         return _module
 
-    os.environ.setdefault(
-        "TORCH_CUDA_ARCH_LIST",
-        "8.0;8.9;9.0",
-    )
-
     _module = load_inline(
         name="batch_topk_jit",
         cpp_sources=_CPP_SRC,
@@ -707,9 +700,9 @@ def varlen_topk(
     topks: torch.Tensor,
     valid_lens: torch.Tensor,
     output: torch.Tensor,
-    buf: Optional[torch.Tensor] = None,
+    buf: torch.Tensor | None = None,
     select_min: bool = False,
-    force_path: Optional[int] = None,
+    force_path: int | None = None,
 ) -> None:
     """Batch top-k selection with variable k per row.
 

@@ -1,53 +1,34 @@
-<!-- markdownlint-disable MD001 MD041 -->
+# Joint Sparsity Self-Speculative Decoding
 
-# Vegas: Verification-Guided Sparse Attention for Self-Speculative Decoding
-
-[![Paper](https://img.shields.io/badge/arXiv-2602.07223-b31b1b.svg)](https://arxiv.org/abs/2602.07223)
-[![Poster](https://img.shields.io/badge/Poster-ICML%202026-1f6feb.svg)](assets/poster.png)
-
-<p align="center">
-  <img alt="Vegas overview" src="assets/overview.png" width=90%>
-</p>
-
-## Abstract
-
-Long-context large language model (LLM) inference has become the norm for today's AI applications. However, it is severely bottlenecked by the increasing memory demands of its KV cache. Previous works have shown that self-speculative decoding with sparse attention, where tokens are drafted using a subset of the KV cache and verified in parallel against the full KV cache, speeds up inference in a lossless manner. However, they rely on a standalone KV selection algorithm to select the KV entries used for drafting and overlook the fact that the criticality of each KV entry is inherently computed during verification.
-
-To this end, we propose Vegas, a self-speculative decoding method with verification-guided sparse attention. Vegas identifies critical KV cache entries as a byproduct of verification and computes attention only over these entries when drafting subsequent tokens. This not only improves the draft token acceptance rate but also incurs low KV selection overhead, thereby improving decoding throughput. Vegas achieves a 1.25×-2.81× speedup in decoding throughput over default vLLM and a 1.15×-1.29× speedup over state-of-the-art sparse attention-based self-speculative decoding methods.
-
-## Features
-
-- **Verification-guided KV selection.** During each verification pass Vegas
-  collects per-token attention importance (raw pre-softmax logits, or
-  rematerialized softmax weights) and ranks the KV cache. On the next draft
-  step, instead of attending to the full cache, the model attends to only the
-  top-k highest-ranked entries plus the most recent tokens. In other words, the
-  draft attends to the entries verification deemed important.
-- **Self-speculation, no extra model.** The same weights draft and verify, so
-  there is nothing extra to download, train, or keep in memory.
-- **Sparse-attention drafting.** The draft pass runs flash-attention over only
-  the selected slots via a custom per-step page table, cutting draft attention
-  cost on long contexts.
-- **CUDA-graph compatible.** Both the verify and draft passes run under CUDA
-  graphs; the sparse page table and per-request KV budgets are rebuilt each
-  propose so replayed graphs stay correct.
+This repository is a research project for studying joint sparsity in
+self-speculative decoding, with an emphasis on long-context inference,
+reproducible FA2/FA3 evaluation, and lossless verification. It was forked from
+the [Vegas codebase](https://github.com/platformxlab/vegas), which serves as the
+initial sparse self-speculative decoding baseline.
 
 ## Installation
 
-Vegas is implemented as a fork of vLLM and builds against a companion
+The project is implemented as a fork of vLLM and builds against a companion
 [flash-attention fork](https://github.com/npz7yyk/vllm-flash-attn) (CUDA 12.x,
-FlashAttention-3). Build from source:
+FlashAttention-2/3). This repository applies an FA2 score-collection patch at
+build time and enables the companion codebase's native SM80/SM86 paged-KV
+mainloop for one-token pages. This permits FA2-platform evaluation on Ampere
+GPUs without a separate KV staging copy while preserving the default FA3 path
+on Hopper. Build from source:
 
 ```bash
-git clone https://github.com/platformxlab/vegas.git
-cd vegas
-pip install -v -e .   # compiles the CUDA/FA3 kernels; takes a while
-pip install datasets  # for benchmarks
+curl -LsSf https://astral.sh/uv/install.sh | sh
+
+uv venv --python 3.12 --managed-python
+source .venv/bin/activate
+uv pip install -v -e .   # compiles the CUDA/FA2 or FA3 kernels; takes a while
+uv pip install datasets  # for benchmarks
 ```
 
 ## Usage
 
-Enable Vegas by passing a `speculative_config` with `method="sparse_attn"`:
+Enable the current sparse self-speculative baseline by passing a
+`speculative_config` with `method="sparse_attn"`:
 
 ```python
 from vllm import LLM, SamplingParams
@@ -85,13 +66,87 @@ A complete, runnable end-to-end example (AIME'25, Qwen3-8B) lives in
 [`benchmarks/benchmark_vegas.py`](benchmarks/benchmark_vegas.py):
 
 ```bash
+# 24 GiB Ampere-friendly smoke benchmark (the script defaults)
 python benchmarks/benchmark_vegas.py
+
+# Compare against the same non-speculative vLLM baseline
+python benchmarks/benchmark_vegas.py --algorithm none
 ```
+
+The defaults use `max_model_len=8192`, `max_tokens=1024`, `max_num_seqs=8`,
+and four AIME prompts so they fit on a single 24 GiB GPU. Increase these values
+with the corresponding CLI flags for throughput experiments. The script also
+runs a short, untimed warmup using the measured batch size because Vegas's
+Triton kernels compile lazily. On the first Vegas launch, the engine also logs
+`Loading sparse-attention CUDA extensions` while `nvcc` builds its JIT
+extensions; this can take several minutes and is cached for later runs.
+FA2/Ampere results validate the algorithm and provide a same-hardware baseline
+comparison, but are not directly comparable to the paper's FA3/Hopper numbers.
+
+For a long-context speed benchmark, the script can stream LongBench v2 and
+truncate the middle of each context to form tokenizer-controlled input-length
+buckets. The following pair of commands compares the baseline and Vegas with
+two 32K-token inputs and exactly 1K output tokens per request:
+
+```bash
+python benchmarks/benchmark_vegas.py \
+  --dataset longbench-v2 --longbench-length long \
+  --algorithm none --max-model-len 40960 \
+  --target-input-tokens 32768 --max-tokens 1024 --ignore-eos \
+  --num-prompts 2 --max-num-seqs 2
+
+python benchmarks/benchmark_vegas.py \
+  --dataset longbench-v2 --longbench-length long \
+  --algorithm vegas --max-model-len 40960 \
+  --target-input-tokens 32768 --max-tokens 1024 --ignore-eos \
+  --num-prompts 2 --max-num-seqs 2
+```
+
+Prefix caching is disabled so repeated inputs cannot make the measured prefill
+artificially cheap. The final report separates metrics shared by every
+algorithm (workload, throughput, TTFT, prefill latency, and TPOT) from the
+speculative-only acceptance and GPU latency breakdown. Vegas additionally
+reports verification- and draft-phase latency using two CUDA event pairs per
+engine step, without an extra profiling synchronization. The trailing
+`RESULT_JSON` line contains the same headline values for scripts.
+
+Compute end-to-end speedup from the two `e2e_output_tokens_per_second` values,
+and decode speedup as baseline `mean_tpot_ms` divided by Vegas
+`mean_tpot_ms`. Use 8K, 16K, and 32K `--target-input-tokens` values to measure
+scaling with context length.
+
+To compare AR and sparse speculative decoding in a single command without
+continuous request admission, use the closed-batch benchmark:
+
+```bash
+python benchmarks/benchmark_vegas_fixed_batch.py \
+  --algorithm vegas --batch-size 4 --num-samples 16 \
+  --max-model-len 8192 --max-tokens 1024
+```
+
+It runs AR first and then Vegas (or `--algorithm streamingllm`) with the same
+prompts and sampling parameters. `--num-samples` must be a multiple of
+`--batch-size`; the example runs four independent closed batches. Each batch
+finishes before the next is admitted, so there is no backlog from which the
+scheduler can refill a completed slot. EOS is respected (`ignore_eos=False`),
+so the active batch may naturally shrink as requests finish. The report shows
+mean, standard deviation, and median batch latency as well as aggregate and
+paired-batch speedups. It also compares AR and speculative wall-clock prefill,
+decode/request, TPOT, and request E2E latency. GPU-event profiling is enabled by
+default for the speculative run and adds lightweight verification- and
+draft-phase timings. It records two event pairs per engine step and does not add
+an explicit profiling synchronization. The default `--temperature 0` uses
+greedy decoding and checks exact generated-token equality for every sample. A
+nonzero temperature can be supplied explicitly for distributional sampling
+comparisons.
+`--ignore-eos` intentionally forces a fixed amount of decoding and is only for
+performance measurement, not LongBench quality evaluation. The initial
+LongBench stream may take tens of seconds to open.
 
 ## Code Layout
 
-Vegas lives in a self-contained module under `vllm/v1/spec_decode/sparse_attn/`,
-plus a handful of edits to wire it into vLLM's speculative-decoding path.
+The sparse self-speculative implementation lives under
+`vllm/v1/spec_decode/sparse_attn/`, plus a small set of vLLM integration edits.
 
 ```text
 vllm/v1/spec_decode/sparse_attn/
@@ -122,25 +177,13 @@ optionally the log-sum-exp for weight rematerialization) as a byproduct of the
 verify pass. This is exposed through the `scores` parameter of
 [`flash_attn_varlen_func`](vllm/vllm_flash_attn/flash_attn_interface.py) and
 implemented in our companion
-[flash-attention fork](https://github.com/npz7yyk/vllm-flash-attn).
-
-## Citation
-
-If you find this project helpful to your research, please consider citing our paper:
-
-```bibtex
-@misc{yue2026vegasselfspeculativedecodingverificationguided,
-      title={Vegas: Self-Speculative Decoding with Verification-Guided Sparse Attention}, 
-      author={Yikang Yue and Yuqi Xue and Jian Huang},
-      year={2026},
-      eprint={2602.07223},
-      archivePrefix={arXiv},
-      primaryClass={cs.LG},
-      url={https://arxiv.org/abs/2602.07223}, 
-}
-```
+[flash-attention fork](https://github.com/npz7yyk/vllm-flash-attn). The companion
+fork implements this path natively for FA3; this repository additionally
+patches both the regular and paged/split-KV FA2 forward kernels to write the
+same first/last-query score buffer without a second QK pass.
 
 ## Acknowledgements
 
-This project is built on top of [vLLM](https://github.com/vllm-project/vllm).
-We thank the vLLM team for laying the foundation for this work.
+This project is built on [vLLM](https://github.com/vllm-project/vllm) and was
+forked from [Vegas](https://github.com/platformxlab/vegas) as its initial
+baseline.

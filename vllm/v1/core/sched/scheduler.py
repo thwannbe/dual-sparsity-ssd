@@ -1251,6 +1251,7 @@ class Scheduler(SchedulerInterface):
         num_nans_in_logits = model_runner_output.num_nans_in_logits
         kv_connector_output = model_runner_output.kv_connector_output
         cudagraph_stats = model_runner_output.cudagraph_stats
+        spec_decode_timing_stats = model_runner_output.spec_decode_timing_stats
 
         perf_stats: PerfStats | None = None
         if self.perf_metrics and self.perf_metrics.is_enabled():
@@ -1457,6 +1458,11 @@ class Scheduler(SchedulerInterface):
         if events:
             batch = KVEventBatch(ts=time.time(), events=events)
             self.kv_event_publisher.publish(batch)
+
+        if self.log_stats and spec_decode_timing_stats is not None:
+            if spec_decoding_stats is None:
+                spec_decoding_stats = SpecDecodingStats.new(self.num_spec_tokens)
+            spec_decoding_stats.observe_timing(spec_decode_timing_stats)
 
         # Create EngineCoreOutputs for all clients that have requests with
         # outputs in this step.

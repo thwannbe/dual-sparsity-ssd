@@ -92,6 +92,84 @@ def ref_paged_attn(
     return torch.cat(outputs, dim=0)
 
 
+@pytest.mark.parametrize("fa_version", [2, 3])
+@torch.inference_mode()
+def test_varlen_paged_kv_collects_first_last_scores(
+    fa_version: int,
+) -> None:
+    """The Vegas score ABI must behave identically on FA2 and FA3."""
+    torch.set_default_device("cuda")
+    if not is_fa_version_supported(fa_version):
+        pytest.skip(
+            f"Flash attention version {fa_version} not supported due "
+            f'to: "{fa_version_unsupported_reason(fa_version)}"'
+        )
+
+    set_random_seed(0)
+    query_lens = [1, 5]
+    kv_lens_list = [17, 23]
+    num_query_heads = 4
+    num_kv_heads = 2
+    head_size = 128
+    block_size = 16
+    max_kv_len = max(kv_lens_list)
+    score_buffer_len = 32
+
+    query = torch.randn(
+        sum(query_lens), num_query_heads, head_size, dtype=torch.bfloat16)
+    key_cache = torch.randn(
+        4, block_size, num_kv_heads, head_size, dtype=torch.bfloat16)
+    value_cache = torch.randn_like(key_cache)
+    cu_query_lens = torch.tensor(
+        [0] + query_lens, dtype=torch.int32).cumsum(0, dtype=torch.int32)
+    kv_lens = torch.tensor(kv_lens_list, dtype=torch.int32)
+    block_tables = torch.tensor([[0, 1], [2, 3]], dtype=torch.int32)
+    scores = torch.full(
+        (len(query_lens), num_query_heads, 2, score_buffer_len),
+        torch.nan,
+        dtype=torch.bfloat16,
+    )
+
+    flash_attn_varlen_func(
+        q=query,
+        k=key_cache,
+        v=value_cache,
+        cu_seqlens_q=cu_query_lens,
+        seqused_k=kv_lens,
+        max_seqlen_q=max(query_lens),
+        max_seqlen_k=max_kv_len,
+        softmax_scale=head_size**-0.5,
+        causal=True,
+        block_table=block_tables,
+        fa_version=fa_version,
+        scores=scores,
+    )
+
+    query_start = 0
+    for batch_idx, (query_len, kv_len) in enumerate(
+        zip(query_lens, kv_lens_list, strict=True)
+    ):
+        blocks = block_tables[batch_idx, : (kv_len + block_size - 1)
+                              // block_size]
+        keys = key_cache[blocks].view(-1, num_kv_heads, head_size)[:kv_len]
+        keys = torch.repeat_interleave(
+            keys, num_query_heads // num_kv_heads, dim=1)
+        request_query = query[query_start:query_start + query_len]
+        raw_scores = torch.einsum(
+            "qhd,khd->hqk", request_query.float(), keys.float())
+
+        for output_row, query_idx in ((0, 0), (1, query_len - 1)):
+            # Only keys visible to this causal query are consumed by Vegas.
+            valid_len = kv_len - query_len + query_idx + 1
+            torch.testing.assert_close(
+                scores[batch_idx, :, output_row, :valid_len].float(),
+                raw_scores[:, query_idx, :valid_len],
+                atol=0.125,
+                rtol=0.01,
+            )
+        query_start += query_len
+
+
 @pytest.mark.parametrize("use_out", [True, False])
 @pytest.mark.parametrize(
     "seq_lens", [[(1, 1328), (5, 18), (129, 463)], [(1, 523), (1, 37), (1, 2011)]]

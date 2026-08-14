@@ -4,6 +4,7 @@
 import functools
 import gc
 import itertools
+import os
 import threading
 import time
 from collections import defaultdict
@@ -145,6 +146,7 @@ from vllm.v1.outputs import (
     ModelRunnerOutput,
     PoolerOutput,
     SamplerOutput,
+    SpecDecodeTimingStats,
     make_empty_encoder_model_runner_output,
 )
 from vllm.v1.pool.metadata import PoolingMetadata, PoolingStates
@@ -156,8 +158,8 @@ from vllm.v1.sample.sampler import Sampler
 from vllm.v1.spec_decode.draft_model import DraftModelProposer
 from vllm.v1.spec_decode.eagle import EagleProposer
 from vllm.v1.spec_decode.medusa import MedusaProposer
-from vllm.v1.spec_decode.sparse_attn import SparseAttnProposer
 from vllm.v1.spec_decode.metadata import SpecDecodeMetadata
+from vllm.v1.spec_decode.sparse_attn import SparseAttnProposer
 from vllm.v1.spec_decode.suffix_decoding import SuffixDecodingProposer
 from vllm.v1.structured_output.utils import apply_grammar_bitmask
 from vllm.v1.utils import CpuGpuBuffer, record_function_or_nullcontext
@@ -325,6 +327,7 @@ class ExecuteModelState(NamedTuple):
     ec_connector_output: ECConnectorOutput | None
     cudagraph_stats: CUDAGraphStat | None
     slot_mappings: dict[str, torch.Tensor] | list[dict[str, torch.Tensor]] | None
+    verification_event_pair: tuple[torch.cuda.Event, torch.cuda.Event] | None
 
 
 class GPUModelRunner(
@@ -344,6 +347,14 @@ class GPUModelRunner(
         self.parallel_config = vllm_config.parallel_config
         self.scheduler_config = vllm_config.scheduler_config
         self.speculative_config = vllm_config.speculative_config
+        sparse_attn_speculation = (
+            self.speculative_config is not None
+            and self.speculative_config.method == "sparse_attn"
+        )
+        self.spec_decode_latency_metrics = (
+            os.getenv("VLLM_SPEC_DECODE_LATENCY_METRICS") == "1"
+            and sparse_attn_speculation
+        )
         self.observability_config = vllm_config.observability_config
 
         from vllm.model_executor.models.utils import set_cpu_offload_max_bytes
@@ -475,8 +486,7 @@ class GPUModelRunner(
                     vllm_config=self.vllm_config, device=self.device
                 )
             elif self.speculative_config.method == "sparse_attn":
-                self.drafter = SparseAttnProposer(
-                    self.vllm_config, self.device, self)
+                self.drafter = SparseAttnProposer(self.vllm_config, self.device, self)
             else:
                 raise ValueError(
                     "Unknown speculative decoding method: "
@@ -1122,8 +1132,10 @@ class GPUModelRunner(
         # Refresh batch metadata with any pending updates.
         self.input_batch.refresh_metadata()
 
-        if self.speculative_config is not None and \
-                self.speculative_config.method == "sparse_attn":
+        if (
+            self.speculative_config is not None
+            and self.speculative_config.method == "sparse_attn"
+        ):
             assert isinstance(self.drafter, SparseAttnProposer)
             self.drafter.update_batch_order(self.input_batch.req_id_to_index)
 
@@ -2881,9 +2893,11 @@ class GPUModelRunner(
 
         sampler_output = self.rejection_sampler(
             spec_decode_metadata,
-            (self.drafter.get_draft_probs(
-                spec_decode_metadata, sampling_metadata)
-             if isinstance(self.drafter, SparseAttnProposer) else None),
+            (
+                self.drafter.get_draft_probs(spec_decode_metadata, sampling_metadata)
+                if isinstance(self.drafter, SparseAttnProposer)
+                else None
+            ),
             logits,
             sampling_metadata,
         )
@@ -3063,6 +3077,44 @@ class GPUModelRunner(
             **model_kwargs,
         )
 
+    def _collect_spec_decode_timing_stats(
+        self,
+        verification_event_pair: tuple[torch.cuda.Event, torch.cuda.Event] | None,
+        draft_event_pair: tuple[torch.cuda.Event, torch.cuda.Event] | None,
+    ) -> SpecDecodeTimingStats | None:
+        """Resolve optional CUDA-event timings after the step's GPU work."""
+        event_pairs = [
+            pair
+            for pair in (
+                verification_event_pair,
+                draft_event_pair,
+            )
+            if pair is not None
+        ]
+        if not event_pairs:
+            return None
+
+        # _bookkeeping_sync() has already materialized sampled IDs for the
+        # synchronous sparse-attention path. Do not add another blocking wait
+        # solely for profiling. If an asynchronous caller reaches this point
+        # before the phase finishes, skip that timing sample instead.
+        if not event_pairs[-1][1].query():
+            return None
+
+        stats = SpecDecodeTimingStats()
+        if verification_event_pair is not None:
+            stats.verification_latency_ms = verification_event_pair[0].elapsed_time(
+                verification_event_pair[1]
+            )
+            stats.verification_steps = 1
+        if draft_event_pair is not None:
+            stats.draft_latency_ms = draft_event_pair[0].elapsed_time(
+                draft_event_pair[1]
+            )
+            stats.draft_steps = 1
+
+        return stats
+
     @staticmethod
     def _is_uniform_decode(
         max_num_scheduled_tokens: int,
@@ -3128,8 +3180,8 @@ class GPUModelRunner(
         has_lora = num_active_loras > 0 if force_has_lora is None else force_has_lora
 
         num_tokens_padded = self._pad_for_sequence_parallelism(num_tokens)
-        dispatch_cudagraph = (
-            lambda num_tokens, disable_full: self.cudagraph_dispatcher.dispatch(
+        dispatch_cudagraph = lambda num_tokens, disable_full: (
+            self.cudagraph_dispatcher.dispatch(
                 num_tokens=num_tokens,
                 has_lora=has_lora,
                 uniform_decode=uniform_decode,
@@ -3529,6 +3581,14 @@ class GPUModelRunner(
             self.model_config.is_encoder_decoder and num_encoder_reqs > 0
         )
 
+        verification_event_pair = None
+        if self.spec_decode_latency_metrics and use_spec_decode:
+            verification_event_pair = (
+                torch.cuda.Event(enable_timing=True),
+                torch.cuda.Event(enable_timing=True),
+            )
+            verification_event_pair[0].record()
+
         # Run the model.
         # Use persistent buffers for CUDA graphs.
         with (
@@ -3613,6 +3673,9 @@ class GPUModelRunner(
                 assert broadcasted is not None
                 logits = broadcasted["logits"]
 
+        if verification_event_pair is not None:
+            verification_event_pair[1].record()
+
         self.execute_model_state = ExecuteModelState(
             scheduler_output,
             logits,
@@ -3624,6 +3687,7 @@ class GPUModelRunner(
             ec_connector_output,
             cudagraph_stats,
             slot_mappings,
+            verification_event_pair,
         )
         self.kv_connector_output = kv_connector_output
         return None
@@ -3663,6 +3727,7 @@ class GPUModelRunner(
             ec_connector_output,
             cudagraph_stats,
             slot_mappings,
+            verification_event_pair,
         ) = self.execute_model_state
         # Clear ephemeral state.
         self.execute_model_state = None
@@ -3693,9 +3758,18 @@ class GPUModelRunner(
         self._draft_token_req_ids = None
         self.input_batch.prev_sampled_token_ids = None
 
+        draft_event_pair = None
+
         def propose_draft_token_ids(sampled_token_ids):
+            nonlocal draft_event_pair
             assert spec_decode_common_attn_metadata is not None
             with record_function_or_nullcontext("gpu_model_runner: draft"):
+                if self.spec_decode_latency_metrics:
+                    draft_event_pair = (
+                        torch.cuda.Event(enable_timing=True),
+                        torch.cuda.Event(enable_timing=True),
+                    )
+                    draft_event_pair[0].record()
                 self._draft_token_ids = self.propose_draft_token_ids(
                     scheduler_output,
                     sampled_token_ids,
@@ -3707,6 +3781,8 @@ class GPUModelRunner(
                     spec_decode_common_attn_metadata,
                     slot_mappings,
                 )
+                if draft_event_pair is not None:
+                    draft_event_pair[1].record()
                 self._copy_draft_token_ids_to_cpu(scheduler_output)
 
         spec_config = self.speculative_config
@@ -3717,8 +3793,9 @@ class GPUModelRunner(
                 <= self.effective_drafter_max_model_len
             )
             use_gpu_toks = (
-                spec_config.use_eagle() or spec_config.uses_draft_model() or
-                spec_config.method == "sparse_attn"
+                spec_config.use_eagle()
+                or spec_config.uses_draft_model()
+                or spec_config.method == "sparse_attn"
             ) and not spec_config.disable_padded_drafter_batch
             if use_gpu_toks:
                 # EAGLE / DraftModel / SparseAttn
@@ -3788,6 +3865,10 @@ class GPUModelRunner(
                 else:
                     logger.error("RoutedExpertsCapturer not initialized.")
 
+            spec_decode_timing_stats = self._collect_spec_decode_timing_stats(
+                verification_event_pair,
+                draft_event_pair,
+            )
             output = ModelRunnerOutput(
                 req_ids=req_ids_output_copy,
                 req_id_to_index=req_id_to_index_output_copy,
@@ -3800,6 +3881,7 @@ class GPUModelRunner(
                 else None,
                 num_nans_in_logits=num_nans_in_logits,
                 cudagraph_stats=cudagraph_stats,
+                spec_decode_timing_stats=spec_decode_timing_stats,
             )
 
         if not self.use_async_scheduling:
@@ -4975,8 +5057,10 @@ class GPUModelRunner(
                     slot_mappings=slot_mappings,
                 )
 
-            if self.speculative_config and \
-                    self.speculative_config.method == "sparse_attn":
+            if (
+                self.speculative_config
+                and self.speculative_config.method == "sparse_attn"
+            ):
                 assert isinstance(self.drafter, SparseAttnProposer)
                 assert self.speculative_config is not None
 
@@ -5637,8 +5721,7 @@ class GPUModelRunner(
                 "and make sure compilation mode is VLLM_COMPILE"
             )
 
-        if self.speculative_config and \
-                self.speculative_config.method == "sparse_attn":
+        if self.speculative_config and self.speculative_config.method == "sparse_attn":
             assert isinstance(self.drafter, SparseAttnProposer)
             self.drafter.initialize_cudagraph_keys(cudagraph_mode)
 

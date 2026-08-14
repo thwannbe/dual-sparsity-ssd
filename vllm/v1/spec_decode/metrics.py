@@ -3,6 +3,7 @@
 
 import time
 from dataclasses import dataclass, field
+from typing import TYPE_CHECKING
 
 import numpy as np
 import prometheus_client
@@ -11,6 +12,9 @@ from vllm.config import SpeculativeConfig
 from vllm.logger import init_logger
 
 logger = init_logger(__name__)
+
+if TYPE_CHECKING:
+    from vllm.v1.outputs import SpecDecodeTimingStats
 
 
 @dataclass
@@ -27,6 +31,10 @@ class SpecDecodingStats:
     num_draft_tokens: int = 0
     num_accepted_tokens: int = 0
     num_accepted_tokens_per_pos: list[int] = field(default_factory=list)
+    verification_latency_ms: float = 0.0
+    verification_steps: int = 0
+    draft_latency_ms: float = 0.0
+    draft_steps: int = 0
 
     @classmethod
     def new(cls, num_spec_tokens: int) -> "SpecDecodingStats":
@@ -42,6 +50,12 @@ class SpecDecodingStats:
         assert num_accepted_tokens <= self.num_spec_tokens
         for i in range(num_accepted_tokens):
             self.num_accepted_tokens_per_pos[i] += 1
+
+    def observe_timing(self, timing_stats: "SpecDecodeTimingStats"):
+        self.verification_latency_ms += timing_stats.verification_latency_ms
+        self.verification_steps += timing_stats.verification_steps
+        self.draft_latency_ms += timing_stats.draft_latency_ms
+        self.draft_steps += timing_stats.draft_steps
 
 
 class SpecDecodingLogging:
@@ -76,6 +90,11 @@ class SpecDecodingLogging:
         num_drafts = np.sum(self.num_drafts)
         num_draft_tokens = np.sum(self.num_draft_tokens)
         num_accepted_tokens = np.sum(self.num_accepted_tokens)
+        if num_drafts == 0:
+            # Timing-only stats can be emitted for the initial proposal before
+            # there is a draft to accept or reject.
+            self.reset()
+            return
         draft_throughput = 0
         accepted_throughput = 0
 
@@ -196,6 +215,23 @@ class SpecDecodingProm:
             for idx, lv in per_engine_labelvalues.items()
         }
 
+        timing_metrics = {
+            "verification_latency_us": "Cumulative target verification GPU time.",
+            "verification_steps": "Number of timed target verification steps.",
+            "draft_latency_us": "Cumulative draft proposal GPU time.",
+            "draft_steps": "Number of timed draft proposal steps.",
+        }
+        self.timing_counters = {}
+        for suffix, documentation in timing_metrics.items():
+            counter = self._counter_cls(
+                name=f"vllm:spec_decode_{suffix}",
+                documentation=documentation,
+                labelnames=labelnames,
+            )
+            self.timing_counters[suffix] = make_per_engine(
+                counter, per_engine_labelvalues
+            )
+
     def observe(self, spec_decoding_stats: SpecDecodingStats, engine_idx: int = 0):
         if not self.spec_decoding_enabled:
             return
@@ -212,6 +248,16 @@ class SpecDecodingProm:
             self.counter_spec_decode_num_accepted_tokens_per_pos[engine_idx]
         ):
             counter.inc(spec_decoding_stats.num_accepted_tokens_per_pos[pos])
+        timing_values = {
+            "verification_latency_us": round(
+                spec_decoding_stats.verification_latency_ms * 1000
+            ),
+            "verification_steps": spec_decoding_stats.verification_steps,
+            "draft_latency_us": round(spec_decoding_stats.draft_latency_ms * 1000),
+            "draft_steps": spec_decoding_stats.draft_steps,
+        }
+        for name, value in timing_values.items():
+            self.timing_counters[name][engine_idx].inc(value)
 
 
 def make_per_engine(

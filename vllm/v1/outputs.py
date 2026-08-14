@@ -121,6 +121,16 @@ class SamplerOutput:
 
 
 @dataclass
+class SpecDecodeTimingStats:
+    """Batch-level GPU timings for one speculative-decoding engine step."""
+
+    verification_latency_ms: float = 0.0
+    verification_steps: int = 0
+    draft_latency_ms: float = 0.0
+    draft_steps: int = 0
+
+
+@dataclass
 class KVConnectorOutput:
     # [req_ids]
     finished_sending: set[str] | None = None
@@ -194,6 +204,10 @@ class ModelRunnerOutput:
 
     # information related to cudagraph execution
     cudagraph_stats: CUDAGraphStat | None = None
+
+    # Optional GPU latency breakdown for speculative decoding. This is only
+    # populated when VLLM_SPEC_DECODE_LATENCY_METRICS=1.
+    spec_decode_timing_stats: SpecDecodeTimingStats | None = None
 
 
 # ModelRunnerOutput wrapper for async scheduling.

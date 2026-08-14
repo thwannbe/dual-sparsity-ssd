@@ -32,6 +32,11 @@ if(VLLM_FLASH_ATTN_SRC_DIR)
   FetchContent_Declare(
           vllm-flash-attn SOURCE_DIR 
           ${VLLM_FLASH_ATTN_SRC_DIR}
+          PATCH_COMMAND
+            ${CMAKE_COMMAND}
+            -DSOURCE_DIR=<SOURCE_DIR>
+            -DPATCH_FILE=${CMAKE_CURRENT_LIST_DIR}/../patches/vllm_flash_attn_fa2_scores.patch
+            -P ${CMAKE_CURRENT_LIST_DIR}/../patches/apply_patch.cmake
           BINARY_DIR ${CMAKE_BINARY_DIR}/vllm-flash-attn
   )
 else()
@@ -40,6 +45,11 @@ else()
           GIT_REPOSITORY https://github.com/npz7yyk/vllm-flash-attn.git
           GIT_TAG 0c05c4b59b4a795f2c2add264fef094e758478e3
           GIT_PROGRESS TRUE
+          PATCH_COMMAND
+            ${CMAKE_COMMAND}
+            -DSOURCE_DIR=<SOURCE_DIR>
+            -DPATCH_FILE=${CMAKE_CURRENT_LIST_DIR}/../patches/vllm_flash_attn_fa2_scores.patch
+            -P ${CMAKE_CURRENT_LIST_DIR}/../patches/apply_patch.cmake
           # Don't share the vllm-flash-attn build between build types
           BINARY_DIR ${CMAKE_BINARY_DIR}/vllm-flash-attn
   )
