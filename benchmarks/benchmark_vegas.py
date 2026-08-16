@@ -161,11 +161,13 @@ def encode_long_text(
     chars_per_side = max(required_tokens * 4, 4096)
     while len(text) > 2 * chars_per_side:
         candidate = text[:chars_per_side] + text[-chars_per_side:]
-        token_ids = tokenizer.encode(candidate, add_special_tokens=False)
+        token_ids = tokenizer.encode(
+            candidate, add_special_tokens=False, verbose=False
+        )
         if len(token_ids) >= required_tokens:
             return token_ids
         chars_per_side *= 2
-    return tokenizer.encode(text, add_special_tokens=False)
+    return tokenizer.encode(text, add_special_tokens=False, verbose=False)
 
 
 def truncate_middle_to_tokens(

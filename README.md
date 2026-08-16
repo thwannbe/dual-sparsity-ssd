@@ -115,30 +115,48 @@ and decode speedup as baseline `mean_tpot_ms` divided by Vegas
 `mean_tpot_ms`. Use 8K, 16K, and 32K `--target-input-tokens` values to measure
 scaling with context length.
 
-To compare AR and sparse speculative decoding in a single command without
-continuous request admission, use the closed-batch benchmark:
+For the paper-style short-input/long-output experiment, use the saturated
+continuous-batching benchmark:
 
 ```bash
-python benchmarks/benchmark_vegas_fixed_batch.py \
-  --algorithm vegas --batch-size 4 --num-samples 16 \
-  --max-model-len 8192 --max-tokens 1024
+python benchmarks/benchmark_continuous_batching.py
+
+# Use every CodeElo row instead of the 30-question AIME'25 replay.
+python benchmarks/benchmark_continuous_batching.py --dataset codeelo
 ```
 
-It runs AR first and then Vegas (or `--algorithm streamingllm`) with the same
-prompts and sampling parameters. `--num-samples` must be a multiple of
-`--batch-size`; the example runs four independent closed batches. Each batch
-finishes before the next is admitted, so there is no backlog from which the
-scheduler can refill a completed slot. EOS is respected (`ignore_eos=False`),
-so the active batch may naturally shrink as requests finish. The report shows
-mean, standard deviation, and median batch latency as well as aggregate and
-paired-batch speedups. It also compares AR and speculative wall-clock prefill,
-decode/request, TPOT, and request E2E latency. GPU-event profiling is enabled by
-default for the speculative run and adds lightweight verification- and
-draft-phase timings. It records two event pairs per engine step and does not add
-an explicit profiling synchronization. The default `--temperature 0` uses
-greedy decoding and checks exact generated-token equality for every sample. A
-nonzero temperature can be supplied explicitly for distributional sampling
-comparisons.
+The default AIME workload duplicates all 30 rows 32 times and submits all 960
+requests concurrently. It uses `max_num_seqs=96`, `max_model_len=37632`, a
+32K output cap, and 92% GPU-memory utilization so both AR and Vegas fit on a
+24 GiB GPU. Larger-memory GPUs can use `--max-num-seqs 128` together with
+`--max-model-len 40960`. As in the paper, the first 400 completions are warmup;
+the final 96 are excluded to avoid scheduler-drain bias. Decoder and speculative
+Prometheus counters are snapshotted around that stable window. AR runs first,
+then Vegas (or `--algorithm streamingllm`) runs with the same workload. The
+report includes throughput interval statistics, TTFT, decode latency, TPOT,
+E2E latency, acceptance, and draft/verification GPU time.
+
+LongBench-v2 has a separate real prefill/decode-disaggregation benchmark:
+
+```bash
+# Requires NIXL and enough memory in both GPU groups. With two large-memory
+# GPUs, GPU 0 runs prefill and GPU 1 runs decode.
+python benchmarks/benchmark_disaggregated_longbench.py
+```
+
+It samples tokenizer-measured 96K-120K inputs, applies the Qwen3 YaRN factor-4
+configuration, and transfers KV cache through `NixlConnector`. GPUs are split
+evenly between one tensor-parallel prefill server and one tensor-parallel
+decode server; an odd extra GPU goes to decode. Only the decode server's
+counters and request timings enter the AR/speculative speedup. Qwen3-8B paper
+defaults are used for maximum decode batch (4), sparsity (7%), and draft length
+(Vegas 9, StreamingLLM 5).
+
+The two-GPU minimum assumes GPUs large enough to hold Qwen3-8B plus a 131K KV
+cache. On 24 GiB cards, use at least four GPUs (two-way tensor parallelism per
+server), reduce the model/context, or use a deliberate KV-cache quantization
+configuration; one 24 GiB GPU per server cannot hold the default BF16 workload.
+
 `--ignore-eos` intentionally forces a fixed amount of decoding and is only for
 performance measurement, not LongBench quality evaluation. The initial
 LongBench stream may take tens of seconds to open.
@@ -169,7 +187,9 @@ Integration points (edited vLLM files):
 | `vllm/v1/spec_decode/utils.py` | Shared spec-decode helpers used by the proposer |
 | `vllm/v1/sample/rejection_sampler.py` | Accept/reject of drafted tokens |
 | `vllm/v1/core/sched/scheduler.py` | Reserves lookahead slots so KV pages are allocated correctly for the draft tokens |
-| `benchmarks/benchmark_vegas.py` | End-to-end example / benchmark |
+| `benchmarks/benchmark_vegas.py` | Small offline smoke benchmark |
+| `benchmarks/benchmark_continuous_batching.py` | Saturated AIME'25/CodeElo serving benchmark |
+| `benchmarks/benchmark_disaggregated_longbench.py` | Decode-only LongBench-v2 P/D benchmark |
 
 The verification-guided selection relies on a modified attention kernel that
 collects the per-token attention logits (raw pre-softmax QK scores, and
