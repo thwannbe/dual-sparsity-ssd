@@ -65,7 +65,7 @@ class FakeMLP(nn.Module):
         return output
 
 
-def test_width_pruning_is_used_only_during_drafting() -> None:
+def test_activation_guides_only_the_next_draft() -> None:
     generator = torch.Generator().manual_seed(7)
     hidden_size = 16
     intermediate_size = 512
@@ -84,45 +84,63 @@ def test_width_pruning_is_used_only_during_drafting() -> None:
     overrider.register_model(model)
 
     assert overrider.draft_model is model
-    assert mlp._draft_ffn_gate_weight.shape == (256, hidden_size)
-    assert mlp._draft_ffn_up_weight.shape == (256, hidden_size)
-    assert mlp._draft_ffn_down_weight.shape == (hidden_size, 256)
-    assert (
-        mlp._draft_ffn_gate_weight.untyped_storage().data_ptr()
-        == mlp.gate_up_proj.weight.untyped_storage().data_ptr()
-    )
-    assert (
-        mlp._draft_ffn_up_weight.untyped_storage().data_ptr()
-        == mlp.gate_up_proj.weight.untyped_storage().data_ptr()
-    )
-    assert (
-        mlp._draft_ffn_down_weight.untyped_storage().data_ptr()
-        == mlp.down_proj.weight.untyped_storage().data_ptr()
-    )
-    # Registering prefix views must not alter the default/verification path.
-    # A consistent channel permutation is algebraically equivalent, though
-    # GEMM reduction order can introduce small floating-point differences.
-    torch.testing.assert_close(mlp(x), dense_output, rtol=1e-4, atol=2e-4)
+    assert mlp._draft_ffn_channel_indices.shape == (256,)
+    # Registration must neither permute nor copy the model weights.
+    torch.testing.assert_close(mlp.gate_up_proj.weight, original_gate_up_weight)
+    torch.testing.assert_close(mlp.down_proj.weight, original_down_weight)
+
+    overrider.prepare_activation_collection(x.shape[0])
+    torch.testing.assert_close(mlp(x), dense_output)
 
     gate, up = original_gate_up_weight.chunk(2, dim=0)
-    score = torch.sqrt(
-        torch.linalg.vector_norm(gate.float(), dim=1)
-        * torch.linalg.vector_norm(up.float(), dim=1)
-    ) * torch.linalg.vector_norm(original_down_weight.float(), dim=0)
+    intermediate = F.silu(F.linear(x, gate)) * F.linear(x, up)
+    score = intermediate.float().abs().mean(dim=0) * torch.linalg.vector_norm(
+        original_down_weight.float(), dim=0
+    )
     indices = torch.topk(score, 256, sorted=False).indices.sort().values
-    expected_gate_up = torch.cat((gate[indices], up[indices]), dim=0)
     expected = F.linear(
-        F.silu(F.linear(x, expected_gate_up)[..., :256])
-        * F.linear(x, expected_gate_up)[..., 256:],
+        F.silu(F.linear(x, gate[indices])) * F.linear(x, up[indices]),
         original_down_weight[:, indices],
     )
 
     overrider.enter_propose()
+    torch.testing.assert_close(mlp._draft_ffn_channel_indices, indices)
     draft_output = mlp(x)
     overrider.exit_propose()
 
     torch.testing.assert_close(draft_output, expected)
-    torch.testing.assert_close(mlp(x), dense_output, rtol=1e-4, atol=2e-4)
+    torch.testing.assert_close(mlp(x), dense_output)
+
+
+def test_padding_rows_do_not_affect_activation_scores() -> None:
+    generator = torch.Generator().manual_seed(11)
+    hidden_size = 8
+    intermediate_size = 512
+    mlp = FakeMLP(
+        torch.randn(2 * intermediate_size, hidden_size, generator=generator),
+        torch.randn(hidden_size, intermediate_size, generator=generator),
+    )
+    overrider = WidthPrunedMLPOverrider(keep_ratio=0.5)
+    overrider.register_model(nn.Sequential(mlp))
+
+    valid_x = torch.randn(2, hidden_size, generator=generator)
+    padded_x = torch.cat((valid_x, torch.full((3, hidden_size), 1000.0)))
+    overrider.prepare_activation_collection(num_actual_tokens=2)
+    mlp(padded_x)
+
+    gate, up = mlp.gate_up_proj.weight.chunk(2, dim=0)
+    expected_activation = F.silu(F.linear(valid_x, gate)) * F.linear(valid_x, up)
+    expected_score = expected_activation.abs().mean(dim=0) * torch.linalg.vector_norm(
+        mlp.down_proj.weight.float(), dim=0
+    )
+    torch.testing.assert_close(overrider.activation_scores[0], expected_score)
+
+    # The next dense pass replaces the score; no EMA/history is retained.
+    mlp(torch.zeros_like(padded_x))
+    torch.testing.assert_close(
+        overrider.activation_scores[0],
+        torch.zeros_like(overrider.activation_scores[0]),
+    )
 
 
 def test_keep_ratio_one_does_not_copy_or_patch_weights() -> None:
@@ -135,7 +153,7 @@ def test_keep_ratio_one_does_not_copy_or_patch_weights() -> None:
     overrider.exit_propose()
 
     assert mlp.forward == original_forward
-    assert not hasattr(mlp, "_draft_ffn_gate_weight")
+    assert not hasattr(mlp, "_draft_ffn_channel_indices")
 
 
 def test_keep_ratio_one_builds_no_runtime_controller() -> None:

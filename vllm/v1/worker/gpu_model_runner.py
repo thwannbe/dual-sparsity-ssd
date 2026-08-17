@@ -3589,6 +3589,13 @@ class GPUModelRunner(
             )
             verification_event_pair[0].record()
 
+        drafter = getattr(self, "drafter", None)
+        if (
+            isinstance(drafter, SparseAttnProposer)
+            and drafter.ffn_overrider is not None
+        ):
+            drafter.prepare_ffn_activation_collection(num_tokens_unpadded)
+
         # Run the model.
         # Use persistent buffers for CUDA graphs.
         with (
@@ -4969,6 +4976,13 @@ class GPUModelRunner(
                 positions = self.xdrope_positions.gpu[:, :num_tokens_padded]
             else:
                 positions = self.positions.gpu[:num_tokens_padded]
+
+            drafter = getattr(self, "drafter", None)
+            if (
+                isinstance(drafter, SparseAttnProposer)
+                and drafter.ffn_overrider is not None
+            ):
+                drafter.prepare_ffn_activation_collection(num_tokens_unpadded)
 
             if get_pp_group().is_first_rank:
                 intermediate_tensors = None

@@ -187,6 +187,11 @@ class SparseAttnProposer:
         # This should be called BEFORE adjust_cudagraph_sizes_for_spec_decode.
         self.cudagraph_dispatcher.initialize_cudagraph_keys(cudagraph_mode)
 
+    def prepare_ffn_activation_collection(self, num_actual_tokens: int) -> None:
+        """Prepare dense prefill/verification to score only non-padding rows."""
+        if self.ffn_overrider is not None:
+            self.ffn_overrider.prepare_activation_collection(num_actual_tokens)
+
     def get_draft_probs(
         self,
         spec_decode_metadata: SpecDecodeMetadata,

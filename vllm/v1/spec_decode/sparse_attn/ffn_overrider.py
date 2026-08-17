@@ -3,12 +3,12 @@
 """Draft-only width pruning for dense SwiGLU MLPs."""
 
 import copy
+from collections.abc import Callable
 from types import MethodType
 from typing import Any
 
 import torch
 import torch.nn as nn
-import torch.nn.functional as F
 
 from vllm.distributed import tensor_model_parallel_all_reduce
 from vllm.logger import init_logger
@@ -17,11 +17,30 @@ logger = init_logger(__name__)
 
 _CHANNEL_ALIGNMENT = 256
 _NORM_CHUNK_ROWS = 256
-_DRAFT_GATE_WEIGHT = "_draft_ffn_gate_weight"
-_DRAFT_UP_WEIGHT = "_draft_ffn_up_weight"
-_DRAFT_DOWN_WEIGHT = "_draft_ffn_down_weight"
-_DRAFT_GATE_BIAS = "_draft_ffn_gate_bias"
-_DRAFT_UP_BIAS = "_draft_ffn_up_bias"
+_CHANNEL_INDICES = "_draft_ffn_channel_indices"
+_ACTIVATION_SCORE = "_draft_ffn_activation_score"
+_DOWN_NORM = "_draft_ffn_down_norm"
+_VALID_TOKENS = "_draft_ffn_valid_tokens"
+
+_collect_activation_score_fn: Callable[..., None] | None = None
+_selected_down_fn: Callable[..., torch.Tensor] | None = None
+_selected_gate_up_fn: Callable[..., torch.Tensor] | None = None
+
+
+def _load_width_pruned_kernels() -> None:
+    """Register custom ops only when FFN pruning is actually enabled."""
+    global _collect_activation_score_fn, _selected_down_fn, _selected_gate_up_fn
+    if _selected_gate_up_fn is not None:
+        return
+    from vllm.v1.spec_decode.sparse_attn.ffn_kernels import (
+        collect_activation_score,
+        selected_down,
+        selected_gate_up,
+    )
+
+    _collect_activation_score_fn = collect_activation_score
+    _selected_down_fn = selected_down
+    _selected_gate_up_fn = selected_gate_up
 
 
 def build_width_pruned_mlp_overrider(
@@ -42,37 +61,60 @@ def _draft_or_dense_forward(mlp: Any, x: torch.Tensor) -> torch.Tensor:
     if not mlp._draft_ffn_enabled:
         return mlp._draft_ffn_dense_forward(x)
 
-    gate = F.linear(
+    gate_up_proj = mlp.gate_up_proj
+    gate_up_bias = None
+    if not gate_up_proj.skip_bias_add:
+        gate_up_bias = gate_up_proj.bias
+    assert _selected_gate_up_fn is not None
+    gate_up = _selected_gate_up_fn(
         x,
-        getattr(mlp, _DRAFT_GATE_WEIGHT),
-        getattr(mlp, _DRAFT_GATE_BIAS),
+        gate_up_proj.weight,
+        gate_up_bias,
+        getattr(mlp, _CHANNEL_INDICES),
     )
-    up = F.linear(
-        x,
-        getattr(mlp, _DRAFT_UP_WEIGHT),
-        getattr(mlp, _DRAFT_UP_BIAS),
-    )
-    intermediate = F.silu(gate) * up
+    # Reuse vLLM's fused SiluAndMul implementation in the draft graph.
+    intermediate = mlp.act_fn(gate_up)
 
     down_proj = mlp.down_proj
-    # RowParallelLinear adds its replicated bias on rank zero before the TP
-    # reduction. Match that behavior for the prefix-view draft projection.
+    # RowParallelLinear adds its replicated bias on rank zero before TP reduce.
     down_bias = None
     if down_proj.tp_rank == 0 and not down_proj.skip_bias_add:
         down_bias = down_proj.bias
-    output = F.linear(intermediate, getattr(mlp, _DRAFT_DOWN_WEIGHT), down_bias)
+    assert _selected_down_fn is not None
+    output = _selected_down_fn(
+        intermediate,
+        down_proj.weight,
+        down_bias,
+        getattr(mlp, _CHANNEL_INDICES),
+    )
     if down_proj.reduce_results and down_proj.tp_size > 1:
         output = tensor_model_parallel_all_reduce(output)
     return output
 
 
+def _activation_and_score(act_fn: Any, x: torch.Tensor) -> torch.Tensor:
+    """Collect scores only in the dense prefill/verification graph."""
+    activation = act_fn._draft_ffn_dense_forward(x)
+    if not act_fn._draft_ffn_enabled:
+        assert _collect_activation_score_fn is not None
+        _collect_activation_score_fn(
+            activation,
+            getattr(act_fn, _DOWN_NORM),
+            getattr(act_fn, _ACTIVATION_SCORE),
+            getattr(act_fn, _VALID_TOKENS),
+        )
+    return activation
+
+
 class WidthPrunedMLPOverrider:
-    """Reorder SwiGLU channels and select prefix views only while drafting.
+    """Select SwiGLU channels using the immediately preceding dense pass.
 
     vLLM's dense SwiGLU layers store the local TP shard as packed
     ``[gate; up]`` rows and store the matching down-projection channels in
-    columns. Each TP rank selects the same number of its locally most
-    important channels, keeping GEMM shapes balanced across ranks.
+    columns. Dense prefill/verification computes
+    ``mean(abs(SiLU(gate) * up)) * ||W_down[:, j]||_2``. The next draft uses
+    the top channels through indexed GEMMs, so changing the selection never
+    copies or repacks the full weights.
     """
 
     def __init__(self, keep_ratio: float):
@@ -82,6 +124,14 @@ class WidthPrunedMLPOverrider:
         self.in_propose = False
         self.mlps: list[Any] = []
         self.draft_model: nn.Module | None = None
+        self.activation_scores: torch.Tensor | None = None
+        self.channel_indices: torch.Tensor | None = None
+        self.valid_tokens: torch.Tensor | None = None
+        self._topk_values: torch.Tensor | None = None
+        self._topk_indices: torch.Tensor | None = None
+        self._sort_order: torch.Tensor | None = None
+        if self.enabled:
+            _load_width_pruned_kernels()
 
     @property
     def enabled(self) -> bool:
@@ -116,13 +166,60 @@ class WidthPrunedMLPOverrider:
                 "draft_ffn_keep_ratio is below 1.0, but no compatible dense "
                 "SwiGLU MLPs were found in the target model"
             )
-        for module in candidates:
-            self._register_mlp(module)
+
+        first_gate_up = candidates[0].gate_up_proj
+        local_intermediate = first_gate_up.weight.shape[0] // 2
+        local_keep = self._local_keep_count(local_intermediate, first_gate_up.tp_size)
+        device = first_gate_up.weight.device
+        for module in candidates[1:]:
+            candidate_intermediate = module.gate_up_proj.weight.shape[0] // 2
+            candidate_keep = self._local_keep_count(
+                candidate_intermediate, module.gate_up_proj.tp_size
+            )
+            if (
+                candidate_intermediate != local_intermediate
+                or candidate_keep != local_keep
+                or module.gate_up_proj.weight.device != device
+            ):
+                raise ValueError(
+                    "activation-guided width pruning requires uniform local "
+                    "intermediate widths on one device"
+                )
+
+        num_layers = len(candidates)
+        self.activation_scores = torch.empty(
+            (num_layers, local_intermediate), device=device, dtype=torch.float32
+        )
+        self.channel_indices = torch.empty(
+            (num_layers, local_keep), device=device, dtype=torch.int64
+        )
+        self._topk_values = torch.empty(
+            (num_layers, local_keep), device=device, dtype=torch.float32
+        )
+        self._topk_indices = torch.empty_like(self.channel_indices)
+        self._sort_order = torch.empty_like(self.channel_indices)
+        self.valid_tokens = torch.tensor(
+            torch.iinfo(torch.int32).max, device=device, dtype=torch.int32
+        )
+
+        # A deterministic initial value is useful during warmup; every real
+        # proposal replaces it with scores from the preceding dense pass.
+        self.activation_scores.zero_()
+        initial_indices = torch.arange(local_keep, device=device, dtype=torch.int64)
+        self.channel_indices.copy_(initial_indices.expand(num_layers, -1))
+
+        for layer_index, module in enumerate(candidates):
+            self._register_mlp(
+                module,
+                self.activation_scores[layer_index],
+                self.channel_indices[layer_index],
+                self.valid_tokens,
+            )
 
         self.draft_model = self._build_draft_model(model)
 
         first = self.mlps[0]
-        local_kept = getattr(first, _DRAFT_GATE_WEIGHT).shape[0]
+        local_kept = getattr(first, _CHANNEL_INDICES).shape[0]
         local_full = first.gate_up_proj.weight.shape[0] // 2
         tp_size = first.gate_up_proj.tp_size
         logger.info(
@@ -203,19 +300,49 @@ class WidthPrunedMLPOverrider:
         alias_parent._modules[path[-1]] = replacement
         return root_alias
 
+    def prepare_activation_collection(self, num_actual_tokens: int) -> None:
+        """Set the padding boundary read by dense score-collection kernels."""
+        assert self.valid_tokens is not None
+        self.valid_tokens.fill_(num_actual_tokens)
+
+    def _update_draft_indices(self) -> None:
+        """Select all layers once for the next multi-token draft."""
+        assert self.activation_scores is not None
+        assert self.channel_indices is not None
+        assert self._topk_values is not None
+        assert self._topk_indices is not None
+        assert self._sort_order is not None
+        torch.topk(
+            self.activation_scores,
+            self.channel_indices.shape[1],
+            dim=1,
+            largest=True,
+            sorted=False,
+            out=(self._topk_values, self._topk_indices),
+        )
+        # Ascending channel order improves locality in the indexed weight loads.
+        torch.sort(
+            self._topk_indices,
+            dim=1,
+            out=(self.channel_indices, self._sort_order),
+        )
+
     def enter_propose(self) -> None:
         if not self.enabled:
             return
         assert not self.in_propose
+        self._update_draft_indices()
         self.in_propose = True
         for mlp in self.mlps:
             mlp._draft_ffn_enabled = True
+            mlp.act_fn._draft_ffn_enabled = True
 
     def exit_propose(self) -> None:
         if not self.enabled:
             return
         for mlp in self.mlps:
             mlp._draft_ffn_enabled = False
+            mlp.act_fn._draft_ffn_enabled = False
         self.in_propose = False
 
     @staticmethod
@@ -225,79 +352,40 @@ class WidthPrunedMLPOverrider:
             for attribute in ("gate_up_proj", "down_proj", "act_fn")
         )
 
-    def _register_mlp(self, mlp: Any) -> None:
+    def _register_mlp(
+        self,
+        mlp: Any,
+        activation_score: torch.Tensor,
+        channel_indices: torch.Tensor,
+        valid_tokens: torch.Tensor,
+    ) -> None:
         gate_up_proj = mlp.gate_up_proj
         down_proj = mlp.down_proj
         self._validate_mlp(gate_up_proj, down_proj, mlp.act_fn)
 
-        gate_up_weight = gate_up_proj.weight.detach()
         down_weight = down_proj.weight.detach()
-        local_intermediate = gate_up_weight.shape[0] // 2
-        local_keep = self._local_keep_count(local_intermediate, gate_up_proj.tp_size)
-
-        gate, up = gate_up_weight.split(local_intermediate, dim=0)
-        # Compute norms in small FP32 chunks once at model initialization.
-        # This avoids materializing an entire projection in FP32.
-        gate_norm = self._row_norm_fp32(gate)
-        up_norm = self._row_norm_fp32(up)
+        # Only the static down-column norm remains weight-derived. Activation
+        # importance and top-k selection are refreshed from every dense pass.
         down_norm = self._column_norm_fp32(down_weight)
-        score = torch.sqrt(gate_norm * up_norm) * down_norm
-        indices = torch.topk(score, local_keep, sorted=False).indices.sort().values
 
-        # Move selected channels to a shared prefix in all three projections.
-        # Dense FFN semantics are preserved because gate, up, and down are
-        # permuted consistently. Draft views then share the full weights'
-        # storage and allocate no persistent compact-weight copy.
-        all_indices = torch.arange(
-            local_intermediate, device=indices.device, dtype=indices.dtype
+        mlp.register_buffer(_CHANNEL_INDICES, channel_indices, persistent=False)
+        mlp.act_fn.register_buffer(
+            _ACTIVATION_SCORE, activation_score, persistent=False
         )
-        is_remaining = torch.ones(
-            local_intermediate, device=indices.device, dtype=torch.bool
-        )
-        is_remaining[indices] = False
-        permutation = torch.cat((indices, all_indices[is_remaining]))
-
-        with torch.no_grad():
-            self._permute_in_place(gate, permutation, dim=0)
-            self._permute_in_place(up, permutation, dim=0)
-            self._permute_in_place(down_weight, permutation, dim=1)
-
-        draft_gate_bias = None
-        draft_up_bias = None
-        if gate_up_proj.bias is not None and not gate_up_proj.skip_bias_add:
-            gate_bias, up_bias = gate_up_proj.bias.detach().split(
-                local_intermediate, dim=0
-            )
-            with torch.no_grad():
-                self._permute_in_place(gate_bias, permutation, dim=0)
-                self._permute_in_place(up_bias, permutation, dim=0)
-            draft_gate_bias = gate_bias[:local_keep]
-            draft_up_bias = up_bias[:local_keep]
-
-        mlp.register_buffer(_DRAFT_GATE_WEIGHT, gate[:local_keep], persistent=False)
-        mlp.register_buffer(_DRAFT_UP_WEIGHT, up[:local_keep], persistent=False)
-        mlp.register_buffer(
-            _DRAFT_DOWN_WEIGHT,
-            down_weight[:, :local_keep],
-            persistent=False,
-        )
-        mlp.register_buffer(_DRAFT_GATE_BIAS, draft_gate_bias, persistent=False)
-        mlp.register_buffer(_DRAFT_UP_BIAS, draft_up_bias, persistent=False)
+        mlp.act_fn.register_buffer(_DOWN_NORM, down_norm, persistent=False)
+        mlp.act_fn.register_buffer(_VALID_TOKENS, valid_tokens, persistent=False)
         # Bypass nn.Module registration for method/state used only to dispatch.
         object.__setattr__(mlp, "_draft_ffn_dense_forward", mlp.forward)
         object.__setattr__(mlp, "_draft_ffn_enabled", False)
         object.__setattr__(mlp, "forward", MethodType(_draft_or_dense_forward, mlp))
+        object.__setattr__(mlp.act_fn, "_draft_ffn_dense_forward", mlp.act_fn.forward)
+        object.__setattr__(mlp.act_fn, "_draft_ffn_enabled", False)
+        object.__setattr__(
+            mlp.act_fn,
+            "forward",
+            MethodType(_activation_and_score, mlp.act_fn),
+        )
         self.mlps.append(mlp)
-
-    @staticmethod
-    def _row_norm_fp32(weight: torch.Tensor) -> torch.Tensor:
-        result = torch.empty(weight.shape[0], device=weight.device, dtype=torch.float32)
-        for start in range(0, weight.shape[0], _NORM_CHUNK_ROWS):
-            end = min(start + _NORM_CHUNK_ROWS, weight.shape[0])
-            chunk = weight[start:end].to(dtype=torch.float32, copy=True)
-            chunk.square_()
-            result[start:end] = chunk.sum(dim=1).sqrt_()
-        return result
 
     @staticmethod
     def _column_norm_fp32(weight: torch.Tensor) -> torch.Tensor:
@@ -310,13 +398,6 @@ class WidthPrunedMLPOverrider:
             chunk.square_()
             squared_sum.add_(chunk.sum(dim=0))
         return squared_sum.sqrt_()
-
-    @staticmethod
-    def _permute_in_place(
-        weight: torch.Tensor, permutation: torch.Tensor, dim: int
-    ) -> None:
-        reordered = weight.index_select(dim, permutation)
-        weight.copy_(reordered)
 
     def _local_keep_count(self, local_intermediate: int, tp_size: int) -> int:
         global_intermediate = local_intermediate * tp_size
