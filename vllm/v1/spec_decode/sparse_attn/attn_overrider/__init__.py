@@ -11,6 +11,21 @@ from vllm.logger import init_logger
 logger = init_logger(__name__)
 
 
+class DenseAttnBypass:
+    """Leave the model's original attention path completely untouched.
+
+    Unlike ``BaseAttnOverrider``, this class does not install a global flash
+    attention wrapper or allocate any sparse-attention state. Its boundary
+    hooks intentionally do nothing.
+    """
+
+    def enter_propose(self) -> None:
+        pass
+
+    def exit_propose(self) -> None:
+        pass
+
+
 class BaseAttnOverrider(ABC):
     _GLOBAL_OVERRIDER_COUNT = 0
 
@@ -95,7 +110,15 @@ def build_attention_overrider(
 ):
     assert vllm_config.speculative_config is not None
 
-    method = vllm_config.speculative_config.sparse_attn_algorithm
+    speculative_config = vllm_config.speculative_config
+    if speculative_config.sparse_attn_ratio == 1.0:
+        logger.info(
+            "Sparse attention is disabled (ratio 1.0); preserving the "
+            "original dense attention path."
+        )
+        return DenseAttnBypass()
+
+    method = speculative_config.sparse_attn_algorithm
     if method == "streamingllm":
         from .streamingllm import StreamingLLMAttnOverrider
         cls = StreamingLLMAttnOverrider
@@ -106,7 +129,7 @@ def build_attention_overrider(
         raise ValueError(f"Unknown sparse_attn_algorithm: {method}")
 
     cls_name = cls.__name__.strip('\'')
-    logger.info(f"Resolved attention overrider: {cls_name}")
+    logger.info("Resolved attention overrider: %s", cls_name)
 
     # Instantiate the attention overrider.
     return cls(

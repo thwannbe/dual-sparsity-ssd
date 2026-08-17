@@ -115,7 +115,18 @@ def parse_args() -> argparse.Namespace:
         "use 0 to disable.",
     )
     parser.add_argument("--num-speculative-tokens", type=int, default=6)
-    parser.add_argument("--sparse-attn-ratio", type=float, default=0.07)
+    parser.add_argument(
+        "--sparse-attn-ratio",
+        type=float,
+        default=0.07,
+        help="KV ratio for sparse draft attention; 1.0 uses dense attention.",
+    )
+    parser.add_argument(
+        "--draft-ffn-keep-ratio",
+        type=float,
+        default=1.0,
+        help="Fraction of SwiGLU channels retained only in draft passes.",
+    )
     parser.add_argument("--tensor-parallel-size", type=int, default=1)
     parser.add_argument("--gpu-memory-utilization", type=float, default=0.9)
     parser.add_argument("--seed", type=int, default=42)
@@ -402,6 +413,8 @@ def main() -> None:
         raise ValueError("--warmup-tokens cannot be negative")
     if args.target_input_tokens is not None and args.target_input_tokens < 1:
         raise ValueError("--target-input-tokens must be positive")
+    if not 0 < args.draft_ffn_keep_ratio <= 1:
+        raise ValueError("--draft-ffn-keep-ratio must be in (0, 1]")
 
     tokenizer = AutoTokenizer.from_pretrained(args.model, trust_remote_code=True)
     warmup_count = (
@@ -454,6 +467,7 @@ def main() -> None:
             "num_speculative_tokens": args.num_speculative_tokens,
             "sparse_attn_algorithm": args.algorithm,
             "sparse_attn_ratio": args.sparse_attn_ratio,
+            "draft_ffn_keep_ratio": args.draft_ffn_keep_ratio,
         }
 
     if speculative_config is not None:

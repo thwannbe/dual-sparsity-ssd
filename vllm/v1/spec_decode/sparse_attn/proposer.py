@@ -30,6 +30,9 @@ from vllm.v1.spec_decode.metadata import SpecDecodeMetadata
 from vllm.v1.spec_decode.sparse_attn.attn_overrider import (
     build_attention_overrider,
 )
+from vllm.v1.spec_decode.sparse_attn.ffn_overrider import (
+    build_width_pruned_mlp_overrider,
+)
 from vllm.v1.spec_decode.utils import (
     PADDING_SLOT_ID,
     eagle_prepare_inputs_padded_kernel,
@@ -159,8 +162,9 @@ class SparseAttnProposer:
         # lazily from get_draft_probs makes the first generate() call appear
         # stuck while nvcc runs in the engine process.
         logger.info(
-            "Loading sparse-attention CUDA extensions. The first run can "
-            "take several minutes while nvcc compiles them."
+            "Loading the self-speculative hidden-state gather helper. "
+            "The first run can "
+            "take several minutes while nvcc compiles it."
         )
         ensure_gather_draft_hidden_states_extension()
 
@@ -169,7 +173,11 @@ class SparseAttnProposer:
             vllm_config=self.vllm_config,
             device=self.device,
         )
-        logger.info("Sparse-attention CUDA extensions are ready.")
+        ffn_keep_ratio = self.speculative_config.draft_ffn_keep_ratio
+        self.ffn_overrider = build_width_pruned_mlp_overrider(
+            keep_ratio=ffn_keep_ratio
+        )
+        logger.info("Self-speculative drafter initialization is complete.")
 
     @property
     def sampled_token_ids(self) -> torch.Tensor:
@@ -269,9 +277,19 @@ class SparseAttnProposer:
 
     def _enter_propose(self):
         self.attn_overrider.enter_propose()
+        try:
+            if self.ffn_overrider is not None:
+                self.ffn_overrider.enter_propose()
+        except BaseException:
+            self.attn_overrider.exit_propose()
+            raise
 
     def _exit_propose(self):
-        self.attn_overrider.exit_propose()
+        try:
+            if self.ffn_overrider is not None:
+                self.ffn_overrider.exit_propose()
+        finally:
+            self.attn_overrider.exit_propose()
 
     @_method_wrapper(enter_fn=_enter_propose, exit_fn=_exit_propose)
     def propose(
@@ -370,7 +388,7 @@ class SparseAttnProposer:
             cudagraph_runtime_mode=cudagraph_runtime_mode,
             slot_mapping=per_layer_slot_mapping,
         ):
-            hidden_states = self.model(**model_kwargs)
+            hidden_states = self.draft_model(**model_kwargs)
             self._save_hidden_states_and_sample(
                 draft_depth=0,
                 hidden_states=hidden_states,
@@ -431,7 +449,7 @@ class SparseAttnProposer:
                 cudagraph_runtime_mode=cudagraph_runtime_mode,
                 slot_mapping=per_layer_slot_mapping,
             ):
-                hidden_states = self.model(**model_kwargs)
+                hidden_states = self.draft_model(**model_kwargs)
                 # Get the logits and sample the next token.
                 self._save_hidden_states_and_sample(
                     draft_depth=step,
@@ -568,6 +586,13 @@ class SparseAttnProposer:
     def load_model(self, target_model: nn.Module) -> None:
         # Self-speculative decoding
         self.model = target_model
+        if self.ffn_overrider is not None:
+            self.ffn_overrider.register_model(target_model)
+            assert self.ffn_overrider.draft_model is not None
+            self.draft_model = self.ffn_overrider.draft_model
+        else:
+            # Exact dense-FFN bypass: no alias, patch, or extra compiled graph.
+            self.draft_model = target_model
 
         # Register attention layers and their metadata builders.
         self.attn_layer_names = list(get_layers_from_vllm_config(
@@ -606,7 +631,7 @@ class SparseAttnProposer:
             cudagraph_runtime_mode=cudagraph_runtime_mode,
             slot_mapping=slot_mappings,
         ):
-            self.model(**kwargs)
+            self.draft_model(**kwargs)
 
     def _get_attention_metadata_builder(self) -> AttentionMetadataBuilder:
         """Find and return the attention metadata builders for EAGLE layers.

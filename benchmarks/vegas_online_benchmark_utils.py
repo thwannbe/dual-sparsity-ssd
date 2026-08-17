@@ -761,6 +761,7 @@ def speculative_config(
     gamma: int,
     sparse_attn_ratio: float,
     sparse_attn_min_tokens: int = 256,
+    draft_ffn_keep_ratio: float = 1.0,
 ) -> dict[str, Any]:
     return {
         "method": "sparse_attn",
@@ -768,6 +769,7 @@ def speculative_config(
         "sparse_attn_algorithm": algorithm,
         "sparse_attn_ratio": sparse_attn_ratio,
         "sparse_attn_min_tokens": sparse_attn_min_tokens,
+        "draft_ffn_keep_ratio": draft_ffn_keep_ratio,
     }
 
 

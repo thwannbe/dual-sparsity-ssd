@@ -164,13 +164,20 @@ class SpeculativeConfig:
     sparse_attn_algorithm: Literal["streamingllm", "vegas"] = "streamingllm"
     """The KV sparsity pattern used by self-speculative decoding."""
 
-    sparse_attn_ratio: float = Field(default=0.05, gt=0, lt=1)
+    sparse_attn_ratio: float = Field(default=0.05, gt=0, le=1)
     """The ratio of tokens to attend to in sparse attention. Only used when
-    sparse_attn_algorithm is specified. Defaults to 0.05."""
+    sparse_attn_algorithm is specified. A value of 1.0 bypasses sparse
+    attention and uses the original dense attention for drafting and
+    verification. Defaults to 0.05."""
 
     sparse_attn_min_tokens: int = Field(default=256, gt=0)
     """The minimum number of tokens to attend to in sparse attention. Only used
     when sparse_attn_algorithm is specified. Defaults to 256."""
+
+    draft_ffn_keep_ratio: float = Field(default=1.0, gt=0, le=1)
+    """Fraction of SwiGLU intermediate channels retained during sparse-attention
+    self-speculative drafting. A value of 1.0 leaves the draft FFNs dense.
+    Verification always uses the full target-model FFNs."""
 
     def compute_hash(self) -> str:
         """
@@ -188,6 +195,9 @@ class SpeculativeConfig:
         # Eagle3 affects the computation graph because it returns intermediate
         # hidden states in addition to the final hidden state.
         factors.append(self.method == "eagle3")
+        factors.append(self.draft_ffn_keep_ratio)
+        factors.append(self.sparse_attn_algorithm)
+        factors.append(self.sparse_attn_ratio)
         hash_str = safe_hash(str(factors).encode(), usedforsecurity=False).hexdigest()
         return hash_str
 

@@ -98,7 +98,12 @@ def parse_args() -> argparse.Namespace:
         default=None,
         help="Draft length gamma (Qwen3-8B paper default: Vegas=6, StreamingLLM=4).",
     )
-    parser.add_argument("--sparse-attn-ratio", type=float, default=0.07)
+    parser.add_argument(
+        "--sparse-attn-ratio",
+        type=float,
+        default=0.07,
+        help="KV ratio for sparse draft attention; 1.0 uses dense attention.",
+    )
     parser.add_argument(
         "--sparse-attn-min-tokens",
         type=int,
@@ -106,6 +111,12 @@ def parse_args() -> argparse.Namespace:
         help="Minimum KV tokens kept by sparse draft attention. Lower this "
         "for short generations where the default 256-token floor would "
         "otherwise dominate --sparse-attn-ratio.",
+    )
+    parser.add_argument(
+        "--draft-ffn-keep-ratio",
+        type=float,
+        default=1.0,
+        help="Fraction of SwiGLU channels retained only in draft passes.",
     )
     parser.add_argument("--temperature", type=float, default=0.6)
     parser.add_argument("--top-p", type=float, default=0.95)
@@ -170,6 +181,8 @@ def validate_args(args: argparse.Namespace) -> None:
         raise ValueError("--max-tokens must be smaller than --max-model-len")
     if not 0 < args.sparse_attn_ratio <= 1:
         raise ValueError("--sparse-attn-ratio must be in (0, 1]")
+    if not 0 < args.draft_ffn_keep_ratio <= 1:
+        raise ValueError("--draft-ffn-keep-ratio must be in (0, 1]")
     if not 0 < args.gpu_memory_utilization <= 1:
         raise ValueError("--gpu-memory-utilization must be in (0, 1]")
     gpus = [gpu.strip() for gpu in args.gpus.split(",") if gpu.strip()]
@@ -274,6 +287,7 @@ def run_one(
             args.num_speculative_tokens,
             args.sparse_attn_ratio,
             args.sparse_attn_min_tokens,
+            draft_ffn_keep_ratio=args.draft_ffn_keep_ratio,
         )
     )
     command = make_server_command(
